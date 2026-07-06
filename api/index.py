@@ -113,3 +113,32 @@ def get_bill():
         )
     except Exception as e:
         return {"error": str(e)}, 500
+    
+    # ... (Keep all your existing imports and helper functions)
+
+@app.route('/api/get-sbpdcl-bill')
+def get_bill():
+    ca_number = request.args.get('ca')
+    # ... (Keep your RSA key retrieval logic as is)
+        
+    # 2. Update this part to be more descriptive for the server
+    # Many Fluentgrid services require an 'action' parameter and specific data format
+    raw_payload = {
+        "action": "DOWNLOAD", # Common action for report/bill download
+        "accno": ca_number,
+        "type": "object"
+    }
+    encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
+    
+    # 3. Request the actual bill PDF
+    bill_resp = requests.post(
+        "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
+        json=encrypted_data,
+        headers={"Content-Type": "application/json"}
+    )
+    
+    # DEBUG: If 500, return the server's response content to see the error message
+    if bill_resp.status_code != 200:
+        return {"error": f"Failed to download bill. Status: {bill_resp.status_code}", "server_response": bill_resp.text}, 500
+            
+    return send_file(...)
