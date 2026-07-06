@@ -67,11 +67,17 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # 1. Fetch the live RSA Public Key
+        # ---------------------------------------------------------
+        # CRITICAL FIX: Use requests.Session() to persist cookies!
+        # The server stores the RSA Private Key in the JSESSIONID.
+        # ---------------------------------------------------------
+        api_session = requests.Session()
+        
+        # 1. Fetch the live RSA Public Key using the static fallback encryption
         raw_config_dict = {"action": "getAllWebConfigurations"}
         config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
         
-        config_resp = requests.post(
+        config_resp = api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service",
             data=config_payload,
             headers={"Content-Type": "text/plain"}
@@ -87,7 +93,7 @@ def get_bill():
         now = datetime.now()
         headers = {
             "Content-Type": "application/json",
-            "Referer": "https://wss.sbpdcl.co.in/",
+            "Referer": "https://wss.sbpdcl.co.in/cportal/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
@@ -106,18 +112,20 @@ def get_bill():
             m_str = f"{m:02d}"
             y_str = str(y)
             
-            # CRITICAL FIX: Try both 'H' (Hindi) and 'E' (English) language parameters
+            # Try Hindi (H) first as per your screenshot, then English (E)
             for lang in ['H', 'E']:
+                
+                # Built from the exact schema inside the Angular source code
                 raw_payload = {
                     "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},{lang},PDF,WSS",
                     "method": "GET",
-                    "auth": "NO", # CRITICAL FIX: Tell server we are a Guest, do not look for a token
+                    "auth": "TOKEN",
                     "baseUrlName": ""
                 }
                 
                 encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
                 
-                bill_resp = requests.post(
+                bill_resp = api_session.post(
                     "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
                     json=encrypted_data,
                     headers=headers
@@ -130,7 +138,6 @@ def get_bill():
                     success_y = y_str
                     break
             
-            # Break the outer loop if we found the PDF
             if pdf_bytes:
                 break
                 
