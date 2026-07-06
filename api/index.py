@@ -65,67 +65,65 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # Standard headers to perfectly mimic Chrome
+        # Standard headers to mimic Chrome
         standard_headers = {
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://wss.sbpdcl.co.in",
             "Referer": "https://wss.sbpdcl.co.in/cportal/",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
         }
+        json_headers = {**standard_headers, "Content-Type": "application/json"}
+        text_headers = {**standard_headers, "Content-Type": "text/plain"}
         
         api_session = requests.Session()
         
-        # 1. Fetch RSA Key (Initializes JSESSIONID)
-        config_payload = encrypt_aes_standard({"action": "getAllWebConfigurations"}, "fgwebcp@2020")
+        # 0. Initial GET to establish load balancer and JSESSIONID cookies
+        api_session.get("https://wss.sbpdcl.co.in/cportal/", headers=standard_headers)
+        
+        # 1. Fetch RSA Key (Static AES)[cite: 1]
         config_resp = api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service",
-            data=config_payload,
-            headers={"Content-Type": "text/plain", "User-Agent": standard_headers["User-Agent"]}
+            data=encrypt_aes_standard({"action": "getAllWebConfigurations"}, "fgwebcp@2020"),
+            headers=text_headers
         )
         rsa_public_key = config_resp.json().get('enc')
         if not rsa_public_key:
             return {"error": "Failed to retrieve RSA Key."}, 500
             
-        # 2. Prime 1: Request NSC Token (Triggers Tomcat session bindings)
-        try:
-            nsc_payload = encrypt_aes_standard({"action": "getNscToken"}, "fgwebcp@2020")
-            api_session.post(
-                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscBridgeService/service",
-                data=nsc_payload,
-                headers={"Content-Type": "text/plain", "User-Agent": standard_headers["User-Agent"]}
-            )
-        except:
-            pass
-
-        # 3. Prime 2: Bill Validation (Binds CA Number to Guest Session)[cite: 5]
-        prime_payload_1 = {
-            "action": f"billing/getBillValidation/{ca_number}",
-            "method": "GET",
-            "auth": "NO",
-            "baseUrlName": ""
-        }
+        # 2. Get NSC Token (Dynamic RSA - FIX APPLIED HERE)[cite: 1]
         api_session.post(
-            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service",
-            json=generate_encrypted_payload(prime_payload_1, rsa_public_key),
-            headers={**standard_headers, "Content-Type": "application/json"}
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscBridgeService/service",
+            json=generate_encrypted_payload({"action": "getNscToken"}, rsa_public_key),
+            headers=json_headers
         )
 
-        # 4. Prime 3: Fetch Bill Details (Locks context for PDF generation)[cite: 5]
-        prime_payload_2 = {
-            "action": "fgexternal/rest/fetchBillDetails/",
-            "method": "POST",
-            "req": {"scno": ca_number},
-            "auth": "TOKEN",
-            "baseUrlName": "",
-            "reqType": "CISENC"
-        }
+        # 3. Prime 1: Bill Validation (Binds CA Number to Guest Session)[cite: 5]
         api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service",
-            json=generate_encrypted_payload(prime_payload_2, rsa_public_key),
-            headers={**standard_headers, "Content-Type": "application/json"}
+            json=generate_encrypted_payload({
+                "action": f"billing/getBillValidation/{ca_number}",
+                "method": "GET",
+                "auth": "NO",
+                "baseUrlName": ""
+            }, rsa_public_key),
+            headers=json_headers
         )
 
-        # 5. Extract the PDF using Bruteforce Authorization Modes
+        # 4. Prime 2: Fetch Bill Details (Locks context for PDF generation)[cite: 5]
+        api_session.post(
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service",
+            json=generate_encrypted_payload({
+                "action": "fgexternal/rest/fetchBillDetails/",
+                "method": "POST",
+                "req": {"scno": ca_number},
+                "auth": "TOKEN",
+                "baseUrlName": "",
+                "reqType": "CISENC"
+            }, rsa_public_key),
+            headers=json_headers
+        )
+
+        # 5. Extract the PDF[cite: 1]
         now = datetime.now()
         pdf_bytes = b''
         success_m, success_y = "", ""
@@ -140,22 +138,18 @@ def get_bill():
             m_str = f"{m:02d}"
             y_str = str(y)
             
-            # The backend may demand "TOKEN" or "NO" depending on the load balancer state
-            for auth_mode in ["TOKEN", "NO"]:
-                raw_payload = {
-                    "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},H,PDF,WSS",
-                    "method": "GET",
-                    "auth": auth_mode, 
-                    "baseUrlName": ""
-                }
-                
+            for lang in ['H', 'E']:
                 bill_resp = api_session.post(
                     "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
-                    json=generate_encrypted_payload(raw_payload, rsa_public_key),
-                    headers={**standard_headers, "Content-Type": "application/json"}
+                    json=generate_encrypted_payload({
+                        "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},{lang},PDF,WSS",
+                        "method": "GET",
+                        "auth": "TOKEN", 
+                        "baseUrlName": ""
+                    }, rsa_public_key),
+                    headers=json_headers
                 )
                 
-                # If 200 OK and larger than 1KB, it is the valid binary PDF stream
                 if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
                     pdf_bytes = bill_resp.content
                     success_m = m_str
@@ -166,9 +160,8 @@ def get_bill():
                 break
                 
         if not pdf_bytes:
-            return {"error": "All 3 priming stages succeeded, but server still refused the PDF generation."}, 404
+            return {"error": "All session stages completed, but server returned 0 bytes for PDF."}, 404
             
-        # 6. Stream directly to Google Apps Script
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype='application/pdf',
