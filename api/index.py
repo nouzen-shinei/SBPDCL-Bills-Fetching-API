@@ -93,8 +93,11 @@ def get_bill():
         
         # 3. Generate the dynamic encrypted payload for the bill request[cite: 1]
         now = datetime.now()
-        month_str = now.strftime("%m")
-        year_str = now.strftime("%Y")
+        target_month = now.month - 1 if now.month > 1 else 12
+        target_year = now.year if now.month > 1 else now.year - 1
+
+        month_str = f"{target_month:02d}"
+        year_str = str(target_year)
         raw_payload = {
             "action": f"billing/getviewbill/{ca_number},{month_str},{year_str},0,PDF,WSS",
             "method": "GET",
@@ -117,10 +120,17 @@ def get_bill():
         )
         
         if bill_resp.status_code != 200:
+            return {"error": f"HTTP {bill_resp.status_code}", "server_response": bill_resp.text}, 500
+
+        if len(bill_resp.content) == 0:
+            return {"error": f"Server returned 0 bytes. Bill for {month_str}-{year_str} might not exist yet."}, 404
+
+        content_type = bill_resp.headers.get('Content-Type', '').lower()
+        if 'application/pdf' not in content_type:
             return {
-                "error": f"Failed to download bill. Status: {bill_resp.status_code}",
-                "server_response": bill_resp.text,
-            }, 500
+                "error": f"Expected PDF but received {content_type}. Bill for {month_str}-{year_str} might not exist.",
+                "server_response": bill_resp.text
+            }, 400
             
         # 5. Return the PDF bytes directly to Apps Script
         return send_file(
