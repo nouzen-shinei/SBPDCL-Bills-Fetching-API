@@ -53,67 +53,99 @@ def get_bill():
     ca_number = request.args.get('ca')
     if not ca_number: return {"error": "Missing CA number"}, 400
     
+    logs = [] # Array to capture the exact server rejection messages
     try:
-        headers = {
+        standard_headers = {
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://wss.sbpdcl.co.in",
             "Referer": "https://wss.sbpdcl.co.in/cportal/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
+        json_headers = {**standard_headers, "Content-Type": "application/json"}
         
-        # CRITICAL FIX: Session object to preserve the JSESSIONID cookie
         api_session = requests.Session()
+        api_session.get("https://wss.sbpdcl.co.in/cportal/", headers=standard_headers)
         
-        # 1. Fetch RSA Key (Static AES)[cite: 1]
+        # 1. Fetch RSA
         config_resp = api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service", 
             data=encrypt_aes_standard({"action": "getAllWebConfigurations"}, "fgwebcp@2020"), 
-            headers={**headers, "Content-Type": "text/plain"}
+            headers={**standard_headers, "Content-Type": "text/plain"}
         )
         rsa_public_key = config_resp.json().get('enc')
         
-        if not rsa_public_key:
-            return {"error": "Failed to retrieve RSA Key."}, 500
+        # 2. NSC Token
+        nsc_resp = api_session.post(
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscBridgeService/service", 
+            json=generate_encrypted_payload({"action": "getNscToken"}, rsa_public_key), 
+            headers=json_headers
+        )
+        access_token = nsc_resp.json().get('access_token')
+        if access_token:
+            json_headers["Authorization"] = f"Bearer {access_token}"
 
-        # 2. Extract PDF using YOUR original schema[cite: 1]
+        # 3. Prime Session
+        api_session.post(
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service", 
+            json=generate_encrypted_payload({"action": f"billing/getBillValidation/{ca_number}", "method": "GET", "auth": "NO", "baseUrlName": ""}, rsa_public_key), 
+            headers=json_headers
+        )
+        api_session.post(
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service", 
+            json=generate_encrypted_payload({"action": "fgexternal/rest/fetchBillDetails/", "method": "POST", "req": {"scno": ca_number}, "auth": "TOKEN", "baseUrlName": "", "reqType": "CISENC"}, rsa_public_key), 
+            headers=json_headers
+        )
+
+        # 4. Fetch PDF Loop
         now = datetime.now()
-        pdf_bytes, success_m, success_y = b'', "", ""
-
         for i in range(4):
             m, y = now.month - i, now.year
             if m <= 0:
                 m += 12; y -= 1
-            
             m_str, y_str = f"{m:02d}", str(y)
             
-            # Reverted to your exact schema which works flawlessly with NscUploadBridgeService[cite: 1]
-            raw_payload = {
-                "action": "DOWNLOAD",
-                "accno": ca_number,
-                "month": m_str,
-                "year": y_str,
-                "type": "object"
-            }
+            # Test both known payload schemas
+            payloads = [
+                {
+                    "action": "DOWNLOAD",
+                    "accno": ca_number,
+                    "month": m_str,
+                    "year": y_str,
+                    "type": "object"
+                },
+                {
+                    "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},H,PDF,WSS",
+                    "method": "GET",
+                    "auth": "TOKEN",
+                    "baseUrlName": ""
+                }
+            ]
             
-            bill_resp = api_session.post(
-                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD", 
-                json=generate_encrypted_payload(raw_payload, rsa_public_key), 
-                headers={**headers, "Content-Type": "application/json"}
-            )
-            
-            # If 200 OK and larger than 1KB, it's the actual PDF[cite: 1]
-            if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
-                pdf_bytes, success_m, success_y = bill_resp.content, m_str, y_str
-                break
+            for p_idx, raw_payload in enumerate(payloads):
+                bill_resp = api_session.post(
+                    "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD", 
+                    json=generate_encrypted_payload(raw_payload, rsa_public_key), 
+                    headers=json_headers
+                )
                 
-        if not pdf_bytes:
-            return {"error": "Server active, but returned 0 bytes for the last 4 months. Bill may not be issued."}, 404
-            
-        return send_file(
-            io.BytesIO(pdf_bytes),
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f'SBPDCL_{success_m}_{success_y}.pdf'
-        )
+                sz = len(bill_resp.content)
+                if bill_resp.status_code == 200 and sz > 1000:
+                    # Success! Verify if the PDF is base64 encoded inside a JSON response
+                    try:
+                        resp_json = bill_resp.json()
+                        if 'data' in resp_json:
+                            pdf_bytes = base64.b64decode(resp_json['data'])
+                            return send_file(io.BytesIO(pdf_bytes), mimetype='application/pdf', as_attachment=True, download_name=f'SBPDCL_{m_str}_{y_str}.pdf')
+                    except:
+                        pass
+                        
+                    # Otherwise return the raw binary bytes
+                    return send_file(io.BytesIO(bill_resp.content), mimetype='application/pdf', as_attachment=True, download_name=f'SBPDCL_{m_str}_{y_str}.pdf')
+                
+                # X-Ray: Capture the exact failure reason from the SBPDCL server
+                logs.append(f"{m_str}-{y_str} (Payload {p_idx}): HTTP {bill_resp.status_code} - {bill_resp.text[:150]}")
+                
+        return {"error": "PDF extraction failed.", "server_logs": logs}, 404
+        
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": "Crash", "exception": str(e), "server_logs": logs}, 500
