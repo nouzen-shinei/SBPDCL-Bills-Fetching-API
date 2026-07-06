@@ -67,13 +67,10 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # ---------------------------------------------------------
-        # CRITICAL FIX: Use requests.Session() to persist cookies!
-        # The server stores the RSA Private Key in the JSESSIONID.
-        # ---------------------------------------------------------
+        # Create a persistent session to maintain the JSESSIONID cookie across requests[cite: 3]
         api_session = requests.Session()
         
-        # 1. Fetch the live RSA Public Key using the static fallback encryption
+        # 1. Fetch the live RSA Public Key using static fallback encryption[cite: 3]
         raw_config_dict = {"action": "getAllWebConfigurations"}
         config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
         
@@ -85,66 +82,76 @@ def get_bill():
         
         config_data = config_resp.json()
         if 'enc' not in config_data:
-            return {"error": f"Failed to retrieve RSA Key."}, 500
+            return {"error": "Failed to retrieve RSA Key."}, 500
             
         rsa_public_key = config_data['enc'] 
         
-        # 2. Smart Loop: Generate formats for the last 3 months
-        now = datetime.now()
-        headers = {
-            "Content-Type": "application/json",
-            "Referer": "https://wss.sbpdcl.co.in/cportal/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        # 2. PRIMING THE SESSION (The Missing Step)
+        # We must call the search endpoint first so the server binds our CA details to the session cookies[cite: 1]
+        prime_payload = {
+            "action": "fgexternal/rest/fetchBillDetails/",
+            "method": "POST",
+            "req": {"scno": ca_number},
+            "auth": "TOKEN",
+            "baseUrlName": "",
+            "reqType": "CISENC"
         }
+        encrypted_prime_data = generate_encrypted_payload(raw_payload=prime_payload, rsa_public_key_str=rsa_public_key)
+        
+        api_session.post(
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.PublishData/service",
+            json=encrypted_data_prime,
+            headers={"Content-Type": "application/json"}
+        )
 
-        pdf_bytes = b''
-        success_m = ""
-        success_y = ""
-
-        # 3. Fire requests backwards until we catch a valid PDF
+        # 3. Generate date configurations for the smart fallback loop
+        now = datetime.now()
+        candidates = []
         for i in range(3):
             m = now.month - i
             y = now.year
             if m <= 0:
                 m += 12
                 y -= 1
+            candidates.append((f"{m:02d}", str(y)))
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Referer": "https://wss.sbpdcl.co.in/cportal/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+
+        pdf_bytes = b''
+        success_m, success_y = "", ""
+
+        # 4. Request the bill PDF inside the authenticated session container[cite: 3]
+        for m_str, y_str in candidates:
+            # Reverting auth back to "TOKEN" to match the main app configuration exactly[cite: 1]
+            raw_payload = {
+                "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},H,PDF,WSS",
+                "method": "GET",
+                "auth": "TOKEN", 
+                "baseUrlName": ""
+            }
             
-            m_str = f"{m:02d}"
-            y_str = str(y)
+            encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
             
-            # Try Hindi (H) first as per your screenshot, then English (E)
-            for lang in ['H', 'E']:
-                
-                # Built from the exact schema inside the Angular source code
-                raw_payload = {
-                    "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},{lang},PDF,WSS",
-                    "method": "GET",
-                    "auth": "TOKEN",
-                    "baseUrlName": ""
-                }
-                
-                encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
-                
-                bill_resp = api_session.post(
-                    "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
-                    json=encrypted_data,
-                    headers=headers
-                )
-                
-                # If 200 OK and larger than 1KB, it's a real PDF
-                if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
-                    pdf_bytes = bill_resp.content
-                    success_m = m_str
-                    success_y = y_str
-                    break
+            bill_resp = api_session.post(
+                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
+                json=encrypted_data,
+                headers=headers
+            )
             
-            if pdf_bytes:
+            if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
+                pdf_bytes = bill_resp.content
+                success_m = m_str
+                success_y = y_str
                 break
                 
         if not pdf_bytes:
-            return {"error": "Tried all formats for the last 3 months, but server returned 0 bytes. Bill not generated yet."}, 404
+            return {"error": "Session primed but server returned 0 bytes for all recent months. The bill may not be issued yet."}, 404
             
-        # 4. Return the valid PDF bytes directly to Apps Script
+        # 5. Return the valid binary file directly to Google Apps Script[cite: 3]
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype='application/pdf',
