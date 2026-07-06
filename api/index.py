@@ -79,26 +79,12 @@ def get_bill():
         
         config_data = config_resp.json()
         if 'enc' not in config_data:
-            return {"error": f"Failed to retrieve RSA Key. Server responded with: {config_resp.text}"}, 500
+            return {"error": f"Failed to retrieve RSA Key."}, 500
             
         rsa_public_key = config_data['enc'] 
         
-        # 2. Smart Loop: Generate formats for the last 6 months
+        # 2. Smart Loop: Generate formats for the last 3 months
         now = datetime.now()
-        candidates = []
-        
-        for i in range(6):
-            m = now.month - i
-            y = now.year
-            if m <= 0:
-                m += 12
-                y -= 1
-            
-            m_dt = datetime(y, m, 1)
-            # Prioritize string format (JUL), then digit format (07)
-            candidates.append((m_dt.strftime("%b").upper(), str(y)))
-            candidates.append((f"{m:02d}", str(y)))
-        
         headers = {
             "Content-Type": "application/json",
             "Referer": "https://wss.sbpdcl.co.in/",
@@ -106,41 +92,57 @@ def get_bill():
         }
 
         pdf_bytes = b''
-        successful_month = ""
-        successful_year = ""
+        success_m = ""
+        success_y = ""
 
         # 3. Fire requests backwards until we catch a valid PDF
-        for m_str, y_str in candidates:
-            raw_payload = {
-                "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},0,PDF,WSS",
-                "method": "GET",
-                "auth": "TOKEN",
-                "baseUrlName": ""
-            }
-            encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
+        for i in range(3):
+            m = now.month - i
+            y = now.year
+            if m <= 0:
+                m += 12
+                y -= 1
             
-            bill_resp = requests.post(
-                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
-                json=encrypted_data,
-                headers=headers
-            )
+            m_str = f"{m:02d}"
+            y_str = str(y)
             
-            # Check if it is a 200 OK and larger than 1KB (meaning it is a real PDF)
-            if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
-                pdf_bytes = bill_resp.content
-                successful_month = m_str
-                successful_year = y_str
+            # CRITICAL FIX: Try both 'H' (Hindi) and 'E' (English) language parameters
+            for lang in ['H', 'E']:
+                raw_payload = {
+                    "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},{lang},PDF,WSS",
+                    "method": "GET",
+                    "auth": "NO", # CRITICAL FIX: Tell server we are a Guest, do not look for a token
+                    "baseUrlName": ""
+                }
+                
+                encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
+                
+                bill_resp = requests.post(
+                    "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
+                    json=encrypted_data,
+                    headers=headers
+                )
+                
+                # If 200 OK and larger than 1KB, it's a real PDF
+                if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
+                    pdf_bytes = bill_resp.content
+                    success_m = m_str
+                    success_y = y_str
+                    break
+            
+            # Break the outer loop if we found the PDF
+            if pdf_bytes:
                 break
                 
         if not pdf_bytes:
-            return {"error": "Tried all formats for the last 6 months, but the server returned 0 bytes. Check if a bill is generated."}, 404
+            return {"error": "Tried all formats for the last 3 months, but server returned 0 bytes. Bill not generated yet."}, 404
             
         # 4. Return the valid PDF bytes directly to Apps Script
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype='application/pdf',
             as_attachment=True,
-            download_name=f'SBPDCL_{successful_month}_{successful_year}.pdf'
+            download_name=f'SBPDCL_{success_m}_{success_y}.pdf'
         )
     except Exception as e:
         return {"error": str(e)}, 500
