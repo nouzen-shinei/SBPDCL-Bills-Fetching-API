@@ -67,7 +67,7 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # 1. Fetch the live RSA Public Key using the static fallback encryption
+        # 1. Fetch the live RSA Public Key
         raw_config_dict = {"action": "getAllWebConfigurations"}
         config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
         
@@ -78,25 +78,26 @@ def get_bill():
         )
         
         config_data = config_resp.json()
-        
         if 'enc' not in config_data:
             return {"error": f"Failed to retrieve RSA Key. Server responded with: {config_resp.text}"}, 500
             
         rsa_public_key = config_data['enc'] 
         
-        # 2. Smart Loop: Generate formats for Current Month and Previous Month
+        # 2. Smart Loop: Generate formats for the last 6 months
         now = datetime.now()
-        prev_m = now.month - 1 if now.month > 1 else 12
-        prev_y = now.year if now.month > 1 else now.year - 1
-        prev_dt = datetime(prev_y, prev_m, 1)
+        candidates = []
         
-        # Priority order: JUL, JUN, 07, 06
-        candidates = [
-            (now.strftime("%b").upper(), str(now.year)),       
-            (prev_dt.strftime("%b").upper(), str(prev_y)),     
-            (f"{now.month:02d}", str(now.year)),               
-            (f"{prev_m:02d}", str(prev_y))                     
-        ]
+        for i in range(6):
+            m = now.month - i
+            y = now.year
+            if m <= 0:
+                m += 12
+                y -= 1
+            
+            m_dt = datetime(y, m, 1)
+            # Prioritize string format (JUL), then digit format (07)
+            candidates.append((m_dt.strftime("%b").upper(), str(y)))
+            candidates.append((f"{m:02d}", str(y)))
         
         headers = {
             "Content-Type": "application/json",
@@ -108,7 +109,7 @@ def get_bill():
         successful_month = ""
         successful_year = ""
 
-        # 3. Fire requests until we catch a valid PDF
+        # 3. Fire requests backwards until we catch a valid PDF
         for m_str, y_str in candidates:
             raw_payload = {
                 "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},0,PDF,WSS",
@@ -124,7 +125,7 @@ def get_bill():
                 headers=headers
             )
             
-            # Check if it's a 200 OK and larger than 1KB (meaning it is a real PDF file)
+            # Check if it is a 200 OK and larger than 1KB (meaning it is a real PDF)
             if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
                 pdf_bytes = bill_resp.content
                 successful_month = m_str
@@ -132,7 +133,7 @@ def get_bill():
                 break
                 
         if not pdf_bytes:
-            return {"error": "Tried formats (JUL, JUN, 07, 06) but server returned 0 bytes for all. Bill for this cycle is not generated yet."}, 404
+            return {"error": "Tried all formats for the last 6 months, but the server returned 0 bytes. Check if a bill is generated."}, 404
             
         # 4. Return the valid PDF bytes directly to Apps Script
         return send_file(
