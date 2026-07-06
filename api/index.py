@@ -22,7 +22,6 @@ def derive_key_and_iv(password, salt, key_length, iv_length):
     return d[:key_length], d[key_length:key_length+iv_length]
 
 def encrypt_aes_standard(data_dict, passphrase):
-    # separators=(',', ':') removes all spaces, matching JS JSON.stringify
     data_str = json.dumps(data_dict, separators=(',', ':'))
     salt = os.urandom(8)
     key, iv = derive_key_and_iv(passphrase.encode('utf-8'), salt, 32, 16)
@@ -30,7 +29,6 @@ def encrypt_aes_standard(data_dict, passphrase):
     padded_data = pad(data_str.encode('utf-8'), AES.block_size)
     ciphertext = cipher.encrypt(padded_data)
     
-    # CryptoJS standard format: "Salted__" + salt + ciphertext
     final_bytes = b"Salted__" + salt + ciphertext
     return base64.b64encode(final_bytes).decode('utf-8')
 
@@ -46,17 +44,13 @@ def generate_encrypted_payload(data_dict, rsa_public_key_str):
     
     aes_key_hex = binascii.hexlify(aes_key).decode('utf-8')
     
-    # --- FIX: Format the RSA key correctly for Python ---
     if "-----BEGIN PUBLIC KEY-----" not in rsa_public_key_str:
-        # Strip any accidental whitespace/newlines and wrap in PEM headers
         clean_key = rsa_public_key_str.replace(' ', '').replace('\n', '').replace('\r', '')
         formatted_key = f"-----BEGIN PUBLIC KEY-----\n{clean_key}\n-----END PUBLIC KEY-----"
     else:
         formatted_key = rsa_public_key_str
         
     rsa_key = RSA.import_key(formatted_key)
-    # ----------------------------------------------------
-    
     cipher_rsa = PKCS1_v1_5.new(rsa_key)
     encrypted_key = base64.b64encode(cipher_rsa.encrypt(aes_key_hex.encode('utf-8'))).decode('utf-8')
     
@@ -73,11 +67,10 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # 1. Fetch the live RSA Public Key using the static fallback encryption[cite: 1]
+        # 1. Fetch the live RSA Public Key using the static fallback encryption
         raw_config_dict = {"action": "getAllWebConfigurations"}
         config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
         
-        # 2. Send the config payload as raw text, NOT a JSON object
         config_resp = requests.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service",
             data=config_payload,
@@ -91,55 +84,62 @@ def get_bill():
             
         rsa_public_key = config_data['enc'] 
         
-        # 3. Generate the dynamic encrypted payload for the bill request[cite: 1]
+        # 2. Smart Loop: Generate formats for Current Month and Previous Month
         now = datetime.now()
-        target_month = now.month - 1 if now.month > 1 else 12
-        target_year = now.year if now.month > 1 else now.year - 1
-
-        month_str = f"{target_month:02d}"
-        year_str = str(target_year)
-        raw_payload = {
-            "action": f"billing/getviewbill/{ca_number},{month_str},{year_str},0,PDF,WSS",
-            "method": "GET",
-            "auth": "TOKEN",
-            "baseUrlName": ""
-        }
-        encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
+        prev_m = now.month - 1 if now.month > 1 else 12
+        prev_y = now.year if now.month > 1 else now.year - 1
+        prev_dt = datetime(prev_y, prev_m, 1)
         
-        # 4. Request the actual bill PDF[cite: 1]
+        # Priority order: JUL, JUN, 07, 06
+        candidates = [
+            (now.strftime("%b").upper(), str(now.year)),       
+            (prev_dt.strftime("%b").upper(), str(prev_y)),     
+            (f"{now.month:02d}", str(now.year)),               
+            (f"{prev_m:02d}", str(prev_y))                     
+        ]
+        
         headers = {
             "Content-Type": "application/json",
             "Referer": "https://wss.sbpdcl.co.in/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
-        bill_resp = requests.post(
-            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
-            json=encrypted_data,
-            headers=headers
-        )
-        
-        if bill_resp.status_code != 200:
-            return {"error": f"HTTP {bill_resp.status_code}", "server_response": bill_resp.text}, 500
+        pdf_bytes = b''
+        successful_month = ""
+        successful_year = ""
 
-        if len(bill_resp.content) == 0:
-            return {"error": f"Server returned 0 bytes. Bill for {month_str}-{year_str} might not exist yet."}, 404
-
-        content_type = bill_resp.headers.get('Content-Type', '').lower()
-        if 'application/pdf' not in content_type:
-            return {
-                "error": f"Expected PDF but received {content_type}. Bill for {month_str}-{year_str} might not exist.",
-                "server_response": bill_resp.text
-            }, 400
+        # 3. Fire requests until we catch a valid PDF
+        for m_str, y_str in candidates:
+            raw_payload = {
+                "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},0,PDF,WSS",
+                "method": "GET",
+                "auth": "TOKEN",
+                "baseUrlName": ""
+            }
+            encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
             
-        # 5. Return the PDF bytes directly to Apps Script
+            bill_resp = requests.post(
+                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
+                json=encrypted_data,
+                headers=headers
+            )
+            
+            # Check if it's a 200 OK and larger than 1KB (meaning it is a real PDF file)
+            if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
+                pdf_bytes = bill_resp.content
+                successful_month = m_str
+                successful_year = y_str
+                break
+                
+        if not pdf_bytes:
+            return {"error": "Tried formats (JUL, JUN, 07, 06) but server returned 0 bytes for all. Bill for this cycle is not generated yet."}, 404
+            
+        # 4. Return the valid PDF bytes directly to Apps Script
         return send_file(
-            io.BytesIO(bill_resp.content),
+            io.BytesIO(pdf_bytes),
             mimetype='application/pdf',
             as_attachment=True,
-            download_name=f'SBPDCL_{month_str}_{year_str}.pdf'
+            download_name=f'SBPDCL_{successful_month}_{successful_year}.pdf'
         )
     except Exception as e:
         return {"error": str(e)}, 500
-    
-    
