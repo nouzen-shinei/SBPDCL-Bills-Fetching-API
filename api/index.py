@@ -28,9 +28,7 @@ def encrypt_aes_standard(data_dict, passphrase):
     cipher = AES.new(key, AES.MODE_CBC, iv)
     padded_data = pad(data_str.encode('utf-8'), AES.block_size)
     ciphertext = cipher.encrypt(padded_data)
-    
-    final_bytes = b"Salted__" + salt + ciphertext
-    return base64.b64encode(final_bytes).decode('utf-8')
+    return base64.b64encode(b"Salted__" + salt + ciphertext).decode('utf-8')
 
 # --- Dynamic RSA/AES Hybrid Logic ---
 def generate_encrypted_payload(data_dict, rsa_public_key_str):
@@ -67,7 +65,7 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # Standard headers matching your browser exactly
+        # Standard headers to perfectly mimic Chrome
         standard_headers = {
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://wss.sbpdcl.co.in",
@@ -75,26 +73,45 @@ def get_bill():
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
         }
         
-        # Create a persistent session to maintain JSESSIONID cookies
         api_session = requests.Session()
         
-        # 1. Fetch the live RSA Public Key
-        raw_config_dict = {"action": "getAllWebConfigurations"}
-        config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
-        
+        # 1. Fetch RSA Key (Initializes JSESSIONID)
+        config_payload = encrypt_aes_standard({"action": "getAllWebConfigurations"}, "fgwebcp@2020")
         config_resp = api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service",
             data=config_payload,
             headers={"Content-Type": "text/plain", "User-Agent": standard_headers["User-Agent"]}
         )
-        
-        config_data = config_resp.json()
-        if 'enc' not in config_data:
+        rsa_public_key = config_resp.json().get('enc')
+        if not rsa_public_key:
             return {"error": "Failed to retrieve RSA Key."}, 500
-        rsa_public_key = config_data['enc'] 
-        
-        # 2. PRIMING THE SESSION (Corrected Endpoint)
-        prime_payload = {
+            
+        # 2. Prime 1: Request NSC Token (Triggers Tomcat session bindings)
+        try:
+            nsc_payload = encrypt_aes_standard({"action": "getNscToken"}, "fgwebcp@2020")
+            api_session.post(
+                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscBridgeService/service",
+                data=nsc_payload,
+                headers={"Content-Type": "text/plain", "User-Agent": standard_headers["User-Agent"]}
+            )
+        except:
+            pass
+
+        # 3. Prime 2: Bill Validation (Binds CA Number to Guest Session)[cite: 5]
+        prime_payload_1 = {
+            "action": f"billing/getBillValidation/{ca_number}",
+            "method": "GET",
+            "auth": "NO",
+            "baseUrlName": ""
+        }
+        api_session.post(
+            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service",
+            json=generate_encrypted_payload(prime_payload_1, rsa_public_key),
+            headers={**standard_headers, "Content-Type": "application/json"}
+        )
+
+        # 4. Prime 3: Fetch Bill Details (Locks context for PDF generation)[cite: 5]
+        prime_payload_2 = {
             "action": "fgexternal/rest/fetchBillDetails/",
             "method": "POST",
             "req": {"scno": ca_number},
@@ -102,49 +119,43 @@ def get_bill():
             "baseUrlName": "",
             "reqType": "CISENC"
         }
-        encrypted_prime_data = generate_encrypted_payload(prime_payload, rsa_public_key)
-        
-        # This MUST go to SpmIntegrationsData, not PublishData!
         api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service",
-            json=encrypted_prime_data,
+            json=generate_encrypted_payload(prime_payload_2, rsa_public_key),
             headers={**standard_headers, "Content-Type": "application/json"}
         )
 
-        # 3. Generate date configurations for the last 6 months
+        # 5. Extract the PDF using Bruteforce Authorization Modes
         now = datetime.now()
-        candidates = []
-        for i in range(6):
+        pdf_bytes = b''
+        success_m, success_y = "", ""
+
+        for i in range(4):
             m = now.month - i
             y = now.year
             if m <= 0:
                 m += 12
                 y -= 1
-            candidates.append((f"{m:02d}", str(y)))
-
-        pdf_bytes = b''
-        success_m, success_y = "", ""
-
-        # 4. Request the actual binary PDF payload
-        for m_str, y_str in candidates:
-            # Try Hindi (H) first, then English (E)
-            for lang in ['H', 'E']:
+            
+            m_str = f"{m:02d}"
+            y_str = str(y)
+            
+            # The backend may demand "TOKEN" or "NO" depending on the load balancer state
+            for auth_mode in ["TOKEN", "NO"]:
                 raw_payload = {
-                    "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},{lang},PDF,WSS",
+                    "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},H,PDF,WSS",
                     "method": "GET",
-                    "auth": "TOKEN", 
+                    "auth": auth_mode, 
                     "baseUrlName": ""
                 }
                 
-                encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
-                
                 bill_resp = api_session.post(
                     "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
-                    json=encrypted_data,
+                    json=generate_encrypted_payload(raw_payload, rsa_public_key),
                     headers={**standard_headers, "Content-Type": "application/json"}
                 )
                 
-                # If 200 OK and larger than 1KB, we successfully downloaded the PDF
+                # If 200 OK and larger than 1KB, it is the valid binary PDF stream
                 if bill_resp.status_code == 200 and len(bill_resp.content) > 1000:
                     pdf_bytes = bill_resp.content
                     success_m = m_str
@@ -155,9 +166,9 @@ def get_bill():
                 break
                 
         if not pdf_bytes:
-            return {"error": "Session primed successfully, but server still returned 0 bytes for the last 6 months."}, 404
+            return {"error": "All 3 priming stages succeeded, but server still refused the PDF generation."}, 404
             
-        # 5. Return the binary stream back to Apps Script
+        # 6. Stream directly to Google Apps Script
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype='application/pdf',
