@@ -93,12 +93,13 @@ def get_bill():
         
         # 3. Generate the dynamic encrypted payload for the bill request[cite: 1]
         now = datetime.now()
+        month_str = now.strftime("%m")
+        year_str = now.strftime("%Y")
         raw_payload = {
-            "action": "DOWNLOAD",
-            "accno": ca_number,
-            "month": now.strftime("%m"),
-            "year": now.strftime("%Y"),
-            "type": "object"
+            "action": f"billing/getviewbill/{ca_number},{month_str},{year_str},0,PDF,WSS",
+            "method": "GET",
+            "auth": "TOKEN",
+            "baseUrlName": ""
         }
         encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
         
@@ -126,7 +127,7 @@ def get_bill():
             io.BytesIO(bill_resp.content),
             mimetype='application/pdf',
             as_attachment=True,
-            download_name=f'SBPDCL_{ca_number}.pdf'
+            download_name=f'SBPDCL_{month_str}_{year_str}.pdf'
         )
     except Exception as e:
         return {"error": str(e)}, 500
