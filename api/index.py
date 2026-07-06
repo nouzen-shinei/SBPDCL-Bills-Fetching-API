@@ -103,10 +103,16 @@ def get_bill():
         encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
         
         # 4. Request the actual bill PDF[cite: 1]
+        headers = {
+            "Content-Type": "application/json",
+            "Referer": "https://wss.sbpdcl.co.in/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
         bill_resp = requests.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
             json=encrypted_data,
-            headers={"Content-Type": "application/json"}
+            headers=headers
         )
         
         if bill_resp.status_code != 200:
