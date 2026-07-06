@@ -67,10 +67,10 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # Create a persistent session to maintain the JSESSIONID cookie across requests[cite: 3]
+        # Create a persistent session container to preserve the JSESSIONID cookies
         api_session = requests.Session()
         
-        # 1. Fetch the live RSA Public Key using static fallback encryption[cite: 3]
+        # 1. Fetch the live RSA Public Key using the static fallback encryption
         raw_config_dict = {"action": "getAllWebConfigurations"}
         config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
         
@@ -86,8 +86,7 @@ def get_bill():
             
         rsa_public_key = config_data['enc'] 
         
-        # 2. PRIMING THE SESSION (The Missing Step)
-        # We must call the search endpoint first so the server binds our CA details to the session cookies[cite: 1]
+        # 2. PRIMING THE SESSION (Simulate portal search step)
         prime_payload = {
             "action": "fgexternal/rest/fetchBillDetails/",
             "method": "POST",
@@ -96,15 +95,17 @@ def get_bill():
             "baseUrlName": "",
             "reqType": "CISENC"
         }
-        encrypted_prime_data = generate_encrypted_payload(raw_payload=prime_payload, rsa_public_key_str=rsa_public_key)
+        # Fixed positional arguments instead of the broken kwarg
+        encrypted_prime_data = generate_encrypted_payload(prime_payload, rsa_public_key)
         
+        # Fixed the variable name typo in the json payload parameter
         api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.PublishData/service",
-            json=encrypted_data_prime,
+            json=encrypted_prime_data,
             headers={"Content-Type": "application/json"}
         )
 
-        # 3. Generate date configurations for the smart fallback loop
+        # 3. Generate date configurations for the fallback loop
         now = datetime.now()
         candidates = []
         for i in range(3):
@@ -124,9 +125,8 @@ def get_bill():
         pdf_bytes = b''
         success_m, success_y = "", ""
 
-        # 4. Request the bill PDF inside the authenticated session container[cite: 3]
+        # 4. Request the actual binary PDF payload inside the primed cookie session
         for m_str, y_str in candidates:
-            # Reverting auth back to "TOKEN" to match the main app configuration exactly[cite: 1]
             raw_payload = {
                 "action": f"billing/getviewbill/{ca_number},{m_str},{y_str},H,PDF,WSS",
                 "method": "GET",
@@ -151,7 +151,7 @@ def get_bill():
         if not pdf_bytes:
             return {"error": "Session primed but server returned 0 bytes for all recent months. The bill may not be issued yet."}, 404
             
-        # 5. Return the valid binary file directly to Google Apps Script[cite: 3]
+        # 5. Return the binary stream back to Apps Script
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype='application/pdf',
