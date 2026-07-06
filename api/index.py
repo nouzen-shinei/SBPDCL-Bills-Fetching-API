@@ -1,4 +1,5 @@
 from flask import Flask, request, send_file
+from datetime import datetime
 import requests
 import io
 import json
@@ -91,9 +92,12 @@ def get_bill():
         rsa_public_key = config_data['enc'] 
         
         # 3. Generate the dynamic encrypted payload for the bill request[cite: 1]
+        now = datetime.now()
         raw_payload = {
             "action": "DOWNLOAD",
             "accno": ca_number,
+            "month": now.strftime("%m"),
+            "year": now.strftime("%Y"),
             "type": "object"
         }
         encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
