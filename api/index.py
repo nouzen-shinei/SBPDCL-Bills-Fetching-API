@@ -7,7 +7,6 @@ import base64
 import binascii
 import os
 import hashlib
-import time
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad
@@ -33,8 +32,6 @@ def encrypt_aes_standard(data_dict, passphrase):
 # --- Dynamic RSA/AES Hybrid Logic ---
 def generate_encrypted_payload(data_dict, rsa_public_key_str):
     json_payload = json.dumps(data_dict, separators=(',', ':'))
-    
-    # CRITICAL FIX: Changed from 32 to 16 bytes to prevent crashing the Java backend
     aes_key = os.urandom(16) 
     iv = os.urandom(16)
     cipher_aes = AES.new(aes_key, AES.MODE_CBC, iv)
@@ -64,76 +61,69 @@ def get_bill():
         }
         
         api_session = requests.Session()
-        api_session.get("https://wss.sbpdcl.co.in/cportal/", headers=headers, timeout=10)
-        time.sleep(0.5) # Gentle pacing
         
-        # 1. RSA
+        # 1. RSA (Timeout increased just in case the server is lagging)
         config_resp = api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service", 
             data=encrypt_aes_standard({"action": "getAllWebConfigurations"}, "fgwebcp@2020"), 
-            headers={**headers, "Content-Type": "text/plain"}, timeout=10
+            headers={**headers, "Content-Type": "text/plain"}, timeout=20
         )
         rsa_public_key = config_resp.json().get('enc')
-        time.sleep(0.5)
         
         # 2. NSC Token
         token_resp = api_session.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscBridgeService/service", 
             json=generate_encrypted_payload({"action": "getNscToken"}, rsa_public_key), 
-            headers={**headers, "Content-Type": "application/json"}, timeout=10
+            headers={**headers, "Content-Type": "application/json"}, timeout=20
         )
         token = token_resp.json().get('access_token')
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        time.sleep(0.5)
 
-        # 3. Bill Validation
-        api_session.post(
-            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service", 
-            json=generate_encrypted_payload({"action": f"billing/getBillValidation/{ca_number}", "method": "GET", "auth": "NO", "baseUrlName": ""}, rsa_public_key), 
-            headers={**headers, "Content-Type": "application/json"}, timeout=10
-        )
-        time.sleep(0.5)
-        
-        # 4. Fetch Details (To get exact month/year)
-        details_resp = api_session.post(
-            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.SpmIntegrationsData/service", 
-            json=generate_encrypted_payload({"action": "fgexternal/rest/fetchBillDetails/", "method": "POST", "req": {"scno": ca_number}, "auth": "TOKEN", "baseUrlName": "", "reqType": "CISENC"}, rsa_public_key), 
-            headers={**headers, "Content-Type": "application/json"}, timeout=10
-        )
-        
-        # Parse exact billing info
-        det_data = details_resp.json()
-        inner_json = json.loads(det_data[0]['data'])
-        b_month_full = inner_json.get('billMonth') 
-        b_month, b_year = b_month_full.split('/')
-        b_no = inner_json.get('billNo')
-        time.sleep(0.5)
+        # 3. Extract PDF (We skip the two slow validation APIs and calculate the parameters ourselves)
+        now = datetime.now()
+        pdf_bytes, success_m, success_y = b'', "", ""
 
-        # 5. Extract PDF (Using exact payload captured from Chrome debugger)
-        payload = {
-            "action": "billing/getviewbill",
-            "method": "POST",
-            "req": {
-                "billNo": b_no,
-                "scno": ca_number,
-                "billMonth": b_month_full,
-                "type": "H"
-            },
-            "auth": "TOKEN",
-            "baseUrlName": ""
-        }
-        
-        pdf_resp = api_session.post(
-            "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD", 
-            json=generate_encrypted_payload(payload, rsa_public_key), 
-            headers={**headers, "Content-Type": "application/json"}, timeout=15
-        )
-        
-        if pdf_resp.status_code == 200 and len(pdf_resp.content) > 1000:
-            return send_file(io.BytesIO(pdf_resp.content), mimetype='application/pdf', as_attachment=True, download_name=f'SBPDCL_{b_month}_{b_year}.pdf')
+        for i in range(3):
+            m, y = now.month - i, now.year
+            if m <= 0:
+                m += 12; y -= 1
             
-        return {"error": "Failed to generate PDF byte stream", "status": pdf_resp.status_code}, 404
+            m_str, y_str = f"{m:02d}", str(y)
+            
+            # The Cheat Code: Generate the exact parameters the server expects
+            bill_month_full = f"{m_str}/{y_str}"
+            bill_no = f"{y_str}{m_str}{ca_number}"
+            
+            payload = {
+                "action": "billing/getviewbill",
+                "method": "POST",
+                "req": {
+                    "billNo": bill_no,
+                    "scno": ca_number,
+                    "billMonth": bill_month_full,
+                    "type": "H"
+                },
+                "auth": "TOKEN",
+                "baseUrlName": ""
+            }
+            
+            pdf_resp = api_session.post(
+                "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD", 
+                json=generate_encrypted_payload(payload, rsa_public_key), 
+                headers={**headers, "Content-Type": "application/json"}, timeout=25
+            )
+            
+            if pdf_resp.status_code == 200 and len(pdf_resp.content) > 1000:
+                pdf_bytes, success_m, success_y = pdf_resp.content, m_str, y_str
+                break
+                
+        if not pdf_bytes:
+            return {"error": "Failed to generate PDF byte stream. Bill may not be generated yet."}, 404
+            
+        return send_file(io.BytesIO(pdf_bytes), mimetype='application/pdf', as_attachment=True, download_name=f'SBPDCL_{success_m}_{success_y}.pdf')
         
+    except requests.exceptions.ReadTimeout:
+        return {"error": "SBPDCL Server timed out. It is currently too slow."}, 504
     except Exception as e:
         return {"error": "Script Exception", "details": str(e)}, 500
