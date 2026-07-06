@@ -34,7 +34,7 @@ def encrypt_aes_standard(data_dict, passphrase):
     return base64.b64encode(final_bytes).decode('utf-8')
 
 # --- Dynamic RSA/AES Hybrid Logic ---
-def generate_encrypted_payload(data_dict, rsa_public_key_pem):
+def generate_encrypted_payload(data_dict, rsa_public_key_str):
     json_payload = json.dumps(data_dict, separators=(',', ':'))
     aes_key = os.urandom(32)
     iv = os.urandom(16)
@@ -44,7 +44,18 @@ def generate_encrypted_payload(data_dict, rsa_public_key_pem):
     encrypted_payload = base64.b64encode(cipher_aes.encrypt(padded_data)).decode('utf-8')
     
     aes_key_hex = binascii.hexlify(aes_key).decode('utf-8')
-    rsa_key = RSA.import_key(rsa_public_key_pem)
+    
+    # --- FIX: Format the RSA key correctly for Python ---
+    if "-----BEGIN PUBLIC KEY-----" not in rsa_public_key_str:
+        # Strip any accidental whitespace/newlines and wrap in PEM headers
+        clean_key = rsa_public_key_str.replace(' ', '').replace('\n', '').replace('\r', '')
+        formatted_key = f"-----BEGIN PUBLIC KEY-----\n{clean_key}\n-----END PUBLIC KEY-----"
+    else:
+        formatted_key = rsa_public_key_str
+        
+    rsa_key = RSA.import_key(formatted_key)
+    # ----------------------------------------------------
+    
     cipher_rsa = PKCS1_v1_5.new(rsa_key)
     encrypted_key = base64.b64encode(cipher_rsa.encrypt(aes_key_hex.encode('utf-8'))).decode('utf-8')
     
