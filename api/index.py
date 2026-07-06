@@ -31,7 +31,7 @@ def encrypt_aes_standard(data_dict, passphrase):
 # --- Dynamic RSA/AES Hybrid Logic ---
 def generate_encrypted_payload(data_dict, rsa_public_key_str):
     json_payload = json.dumps(data_dict, separators=(',', ':'))
-    aes_key = os.urandom(32) 
+    aes_key = os.urandom(16) 
     iv = os.urandom(16)
     cipher_aes = AES.new(aes_key, AES.MODE_CBC, iv)
     padded_data = pad(json_payload.encode('utf-8'), AES.block_size)
@@ -93,15 +93,19 @@ def get_bill():
             headers={**headers, "Content-Type": "application/json"}, timeout=15
         )
         
-        # Safely parse the server's response. If it fails, we abort before crashing them.
+        # Safely parse the server's response.
         try:
             det_data = details_resp.json()
-            inner_json = json.loads(det_data[0]['data'])
+            raw_data = det_data[0]['data']
+            
+            # FIXED: Handle both stringified JSON and direct dictionary responses
+            inner_json = raw_data if isinstance(raw_data, dict) else json.loads(raw_data)
+            
             b_month_full = inner_json.get('billMonth')  # e.g. '06/2026'
             b_no = inner_json.get('billNo')             # e.g. '202606227201500499'
             b_month_clean = b_month_full.replace('/', '_')
-        except (KeyError, IndexError, json.JSONDecodeError):
-            return {"error": "Failed to parse bill details from database. Account may not be active or bill is ungenerated."}, 404
+        except Exception as e:
+            return {"error": f"Failed to parse bill details from database. Details: {str(e)}"}, 404
 
         # 5. Extract PDF (Exactly one request, using guaranteed valid database credentials)
         payload = {
