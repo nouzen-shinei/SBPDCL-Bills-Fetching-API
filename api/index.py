@@ -21,7 +21,8 @@ def derive_key_and_iv(password, salt, key_length, iv_length):
     return d[:key_length], d[key_length:key_length+iv_length]
 
 def encrypt_aes_standard(data_dict, passphrase):
-    data_str = json.dumps(data_dict)
+    # separators=(',', ':') removes all spaces, matching JS JSON.stringify
+    data_str = json.dumps(data_dict, separators=(',', ':'))
     salt = os.urandom(8)
     key, iv = derive_key_and_iv(passphrase.encode('utf-8'), salt, 32, 16)
     cipher = AES.new(key, AES.MODE_CBC, iv)
@@ -34,7 +35,7 @@ def encrypt_aes_standard(data_dict, passphrase):
 
 # --- Dynamic RSA/AES Hybrid Logic ---
 def generate_encrypted_payload(data_dict, rsa_public_key_pem):
-    json_payload = json.dumps(data_dict)
+    json_payload = json.dumps(data_dict, separators=(',', ':'))
     aes_key = os.urandom(32)
     iv = os.urandom(16)
     
@@ -60,14 +61,17 @@ def get_bill():
         return {"error": "Missing CA number"}, 400
         
     try:
-        # 1. Fetch the live RSA Public Key using the static fallback encryption
-        config_payload = encrypt_aes_standard({"action": "getAllWebConfigurations"}, "fgwebcp@2020")
+        # 1. Fetch the live RSA Public Key using the static fallback encryption[cite: 1]
+        raw_config_dict = {"action": "getAllWebConfigurations"}
+        config_payload = encrypt_aes_standard(raw_config_dict, "fgwebcp@2020")
         
+        # 2. Send the config payload as raw text, NOT a JSON object
         config_resp = requests.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.CPCommonConfigService/service",
-            json=config_payload,
-            headers={"Content-Type": "application/json"}
+            data=config_payload,
+            headers={"Content-Type": "text/plain"}
         )
+        
         config_data = config_resp.json()
         
         if 'enc' not in config_data:
@@ -75,11 +79,11 @@ def get_bill():
             
         rsa_public_key = config_data['enc'] 
         
-        # 2. Generate the dynamic encrypted payload for the bill request
+        # 3. Generate the dynamic encrypted payload for the bill request[cite: 1]
         raw_payload = {"strCANumber": ca_number}
         encrypted_data = generate_encrypted_payload(raw_payload, rsa_public_key)
         
-        # 3. Request the actual bill PDF
+        # 4. Request the actual bill PDF[cite: 1]
         bill_resp = requests.post(
             "https://wss.sbpdcl.co.in/fgweb/web/json/plugin/com.fluentgrid.cp.api.NscUploadBridgeService/service?&rtype=DOWNLOAD",
             json=encrypted_data,
@@ -89,7 +93,7 @@ def get_bill():
         if bill_resp.status_code != 200:
             return {"error": f"Failed to download bill. Status: {bill_resp.status_code}"}, 500
             
-        # 4. Return the PDF bytes directly to Apps Script
+        # 5. Return the PDF bytes directly to Apps Script
         return send_file(
             io.BytesIO(bill_resp.content),
             mimetype='application/pdf',
