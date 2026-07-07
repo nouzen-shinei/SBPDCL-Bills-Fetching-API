@@ -261,6 +261,3 @@ If you want to extend the project later, these are sensible additions:
 - Log the last successful month into Drive or Apps Script properties.
 - Add support for multiple CA numbers if you need to manage more than one account.
 
-## License
-
-No license is defined in this repository yet. Add one before distributing the project widely.
